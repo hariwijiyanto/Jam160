@@ -1149,3 +1149,92 @@ __global__ void find_hash_kernel_multi_gpu(
         }
     }
 }
+
+// ===================================================================
+// KERNEL YANG DIOPTIMISASI UNTUK PERFORMA LEBIH TINGGI
+// ===================================================================
+
+extern "C"
+__global__ void find_hash_kernel_high_perf(
+    const BigInt* start_key,
+    unsigned long long keys_per_launch,
+    const BigInt* step,
+    const uint8_t* d_targets,
+    int num_targets,
+    BigInt* d_result,
+    int* d_found_flag
+) {
+    unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= keys_per_launch || *d_found_flag) return;
+
+    // OPTIMIZED: Gunakan register variables untuk performa better
+    BigInt current_priv;
+    BigInt priv_idx_mul_step;
+
+    // OPTIMIZED: Loop unrolling untuk perkalian
+    uint32_t idx_low = (uint32_t)idx;
+    uint32_t carry = 0;
+    
+    #pragma unroll
+    for (int i = 0; i < BIGINT_WORDS; ++i) {
+        uint64_t product = (uint64_t)step->data[i] * idx_low + carry;
+        priv_idx_mul_step.data[i] = (uint32_t)product;
+        carry = product >> 32;
+    }
+
+    // OPTIMIZED: Penambahan dengan carry propagation yang efisien
+    uint64_t sum_carry = 0;
+    #pragma unroll
+    for (int i = 0; i < BIGINT_WORDS; ++i) {
+        uint64_t sum = (uint64_t)start_key->data[i] + priv_idx_mul_step.data[i] + sum_carry;
+        current_priv.data[i] = (uint32_t)sum;
+        sum_carry = sum >> 32;
+    }
+
+    // Modulo n (curve order) - OPTIMIZED: hindari copy jika tidak perlu
+    if (compare_bigint(&current_priv, &const_n) >= 0) {
+        ptx_u256Sub(&current_priv, &current_priv, &const_n);
+    }
+
+    // PUBLIC KEY DENGAN PRECOMPUTED MULTIPLICATION
+    ECPointJac result_jac;
+    scalar_multiply_jac_precomputed(&result_jac, &current_priv);
+
+    // KONVERSI KE AFFINE COORDINATES
+    ECPoint public_key;
+    jacobian_to_affine(&public_key, &result_jac);
+
+    if (public_key.infinity) return;
+
+    // HASH160 COMPUTATION
+    uint8_t final_hash160[20];
+    uint8_t is_odd = public_key.y.data[0] & 1;
+    _GetHash160Comp((uint64_t*)public_key.x.data, is_odd, final_hash160);
+
+    // PERBANDINGAN DENGAN TARGET HASH160 - OPTIMIZED: early exit
+    for (int i = 0; i < num_targets; i++) {
+        const uint8_t* target_hash = &d_targets[i * 20];
+        
+        // OPTIMIZED: Bandingkan 32-bit words untuk speed
+        bool match = true;
+        #pragma unroll
+        for (int j = 0; j < 5; j++) {
+            uint32_t* hash_word = (uint32_t*)final_hash160;
+            uint32_t* target_word = (uint32_t*)target_hash;
+            if (hash_word[j] != target_word[j]) {
+                match = false;
+                break;
+            }
+        }
+        
+        if (match) {
+            if (atomicCAS(d_found_flag, 0, 1) == 0) {
+                #pragma unroll
+                for (int k = 0; k < BIGINT_WORDS; k++) {
+                    d_result->data[k] = current_priv.data[k];
+                }
+            }
+            return;
+        }
+    }
+}
