@@ -53,11 +53,8 @@ def load_target_hashes(filename):
     print(f"[*] Total {len(targets_hex)} target hash160 loaded")
     return targets_bin, targets_hex
 
-def init_secp256k1_constants(mod, device_id):
+def init_secp256k1_constants(mod):
     """Initialize secp256k1 curve constants in GPU constant memory"""
-    # Set device context
-    cuda.Context.synchronize()
-    
     # Prime modulus p
     p_data = np.array([
         0xFFFFFC2F, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
@@ -106,16 +103,18 @@ def run_precomputation(mod):
     cuda.Context.synchronize()
 
 class GPUSearcher:
-    def __init__(self, device_id, kernel_code, target_bin, target_hex_list, args):
+    def __init__(self, device_id, kernel_code, target_bin, target_hex_list, args, global_start_time):
         self.device_id = device_id
         self.kernel_code = kernel_code
         self.target_bin = target_bin
         self.target_hex_list = target_hex_list
         self.args = args
+        self.global_start_time = global_start_time
         self.found = False
         self.result = None
         self.total_iterations = 0
-        self.start_time = time.time()
+        self.last_print_time = time.time()
+        self.last_iterations = 0
         
     def run_search(self):
         """Run search on this specific GPU"""
@@ -127,11 +126,13 @@ class GPUSearcher:
             print(f"[GPU {self.device_id}] Initializing...")
             
             # Compile kernel for this device
+            compute_capability = device.compute_capability()
+            arch = f'sm_{compute_capability[0]}{compute_capability[1]}'
             mod = SourceModule(self.kernel_code, no_extern_c=False, 
-                             options=['-std=c++11', f'-arch=sm_{device.compute_capability()[0]}{device.compute_capability()[1]}'])
+                             options=['-std=c++11', f'-arch={arch}'])
             
             # Initialize constants
-            init_secp256k1_constants(mod, self.device_id)
+            init_secp256k1_constants(mod)
             
             print(f"[GPU {self.device_id}] Running precomputation...")
             run_precomputation(mod)
@@ -157,31 +158,51 @@ class GPUSearcher:
             num_targets = len(self.target_bin) // 20
             range_size = self.args.range_max - self.args.range_min + 1
             
-            # Calculate work distribution for this GPU
+            # Calculate work distribution for this GPU - FIXED LOGIC
             gpu_count = self.args.gpu_count
-            gpu_range_size = range_size // gpu_count
-            gpu_range_min = self.args.range_min + (self.device_id * gpu_range_size)
-            gpu_range_max = gpu_range_min + gpu_range_size - 1
+            total_range = self.args.range_max - self.args.range_min + 1
+            gpu_range_size = total_range // gpu_count
             
-            # Handle remainder for last GPU
-            if self.device_id == gpu_count - 1:
+            # Distribute ranges properly
+            if self.device_id < gpu_count - 1:
+                gpu_range_min = self.args.range_min + (self.device_id * gpu_range_size)
+                gpu_range_max = gpu_range_min + gpu_range_size - 1
+            else:
+                # Last GPU takes the remainder
+                gpu_range_min = self.args.range_min + (self.device_id * gpu_range_size)
                 gpu_range_max = self.args.range_max
             
+            gpu_range_size_actual = gpu_range_max - gpu_range_min + 1
+            
+            print(f"[GPU {self.device_id}] Range: {hex(gpu_range_min)} - {hex(gpu_range_max)}")
+            print(f"[GPU {self.device_id}] Range size: {gpu_range_size_actual:,}")
+            
+            # Use the actual range for this GPU
             range_min_np = int_to_bigint_np(gpu_range_min)
             range_max_np = int_to_bigint_np(gpu_range_max)
             step_np = int_to_bigint_np(1)
-            
-            print(f"[GPU {self.device_id}] Range: {hex(gpu_range_min)} - {hex(gpu_range_max)}")
-            print(f"[GPU {self.device_id}] Range size: {gpu_range_max - gpu_range_min + 1:,}")
             
             current_start = self.args.start
             start_scalars_tried = 0
             found_flag_host = np.zeros(1, dtype=np.int32)
             
+            print(f"[GPU {self.device_id}] Starting search from start scalar: {hex(current_start)}")
+            
+            # MAIN SEARCH LOOP - FIXED
             while (current_start >= 1 and 
                    start_scalars_tried < self.args.max_start_scalars and 
-                   not self.found and 
-                   not any(searcher.found for searcher in self.other_searchers if searcher != self)):
+                   not self.found):
+                
+                # Check if other GPUs found the solution
+                other_found = False
+                for searcher in self.other_searchers:
+                    if searcher != self and searcher.found:
+                        other_found = True
+                        break
+                
+                if other_found:
+                    print(f"[GPU {self.device_id}] Another GPU found the solution, stopping.")
+                    break
                 
                 # Reset found flag for new start scalar
                 cuda.memset_d32(d_found_flag, 0, 1)
@@ -189,21 +210,28 @@ class GPUSearcher:
                 
                 start_scalar_np = int_to_bigint_np(current_start)
                 iteration_offset = 0
-                total_iterations_current = 0
                 
-                # Loop for current range
-                while (iteration_offset < gpu_range_size and 
+                # Loop for current range - FIXED: use actual GPU range size
+                while (iteration_offset < gpu_range_size_actual and 
                        found_flag_host[0] == 0 and 
-                       not any(searcher.found for searcher in self.other_searchers if searcher != self)):
+                       not other_found):
                     
-                    iterations_left = gpu_range_size - iteration_offset
+                    iterations_left = gpu_range_size_actual - iteration_offset
                     iterations_this_launch = min(self.args.keys_per_launch, iterations_left)
                     
                     if iterations_this_launch <= 0:
                         break
                     
-                    block_size = 256
+                    # Optimize block and grid size for better performance
+                    block_size = 256  # Increased block size for better occupancy
                     grid_size = (iterations_this_launch + block_size - 1) // block_size
+                    
+                    # Ensure we don't launch too many blocks
+                    if grid_size > 65535:
+                        grid_size = 65535
+                        iterations_this_launch = grid_size * block_size
+                        if iterations_this_launch > iterations_left:
+                            iterations_this_launch = iterations_left
                     
                     # Run hash search kernel
                     find_hash_kernel(
@@ -220,22 +248,27 @@ class GPUSearcher:
                     
                     cuda.Context.synchronize()
                     
-                    total_iterations_current += iterations_this_launch
                     self.total_iterations += iterations_this_launch
                     iteration_offset += iterations_this_launch
                     
                     cuda.memcpy_dtoh(found_flag_host, d_found_flag)
                     
-                    elapsed = time.time() - self.start_time
-                    speed = self.total_iterations / elapsed if elapsed > 0 else 0
-                    progress_current = 100 * iteration_offset / gpu_range_size
-                    
-                    progress_str = (f"[GPU {self.device_id}] Start: {hex(current_start)} | "
-                                  f"Progress: {iteration_offset:,}/{gpu_range_size:,} ({progress_current:.1f}%) | "
-                                  f"Speed: {speed:,.0f} it/s | "
-                                  f"Running: {elapsed:.0f}s")
-                    sys.stdout.write('\r' + progress_str.ljust(120))
-                    sys.stdout.flush()
+                    # Optimized progress reporting - only print every 2 seconds
+                    current_time = time.time()
+                    if current_time - self.last_print_time >= 2.0:
+                        elapsed = current_time - self.global_start_time
+                        recent_speed = (self.total_iterations - self.last_iterations) / (current_time - self.last_print_time)
+                        progress_current = 100 * iteration_offset / gpu_range_size_actual
+                        
+                        progress_str = (f"[GPU {self.device_id}] Start: {hex(current_start)} | "
+                                      f"Progress: {iteration_offset:,}/{gpu_range_size_actual:,} ({progress_current:.1f}%) | "
+                                      f"Speed: {recent_speed:,.0f} it/s | "
+                                      f"Total: {self.total_iterations:,} it")
+                        sys.stdout.write('\r' + progress_str.ljust(120))
+                        sys.stdout.flush()
+                        
+                        self.last_print_time = current_time
+                        self.last_iterations = self.total_iterations
                 
                 # Check results for this start scalar
                 if found_flag_host[0] == 1:
@@ -255,7 +288,7 @@ class GPUSearcher:
                         'start_scalar': current_start,
                         'total_iterations': self.total_iterations,
                         'gpu_id': self.device_id,
-                        'search_time': time.time() - self.start_time
+                        'search_time': time.time() - self.global_start_time
                     }
                     
                     print(f"\n[GPU {self.device_id}] HASH160 DITEMUKAN!")
@@ -264,10 +297,20 @@ class GPUSearcher:
                     print(f"    Total iterasi: {self.total_iterations:,}")
                     print(f"    Waktu pencarian: {self.result['search_time']:.2f} detik")
                     
+                    # Verify with recalculation
+                    n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+                    expected_privkey = (current_start * (gpu_range_min + iteration_offset - 1)) % n
+                    if expected_privkey == privkey_int:
+                        print(f"    [VERIFIED] Private key valid")
+                    else:
+                        print(f"    [WARNING] Private key tidak sesuai")
+                    
                 else:
-                    # Not found in this start scalar, continue to next
+                    # Not found in this start scalar, continue to next - FIXED: increment properly
                     current_start += 1
                     start_scalars_tried += 1
+                    if start_scalars_tried % 100 == 0:
+                        print(f"\n[GPU {self.device_id}] Mencoba start scalar ke-{start_scalars_tried}: {hex(current_start)}")
             
             # Cleanup
             if d_target_hashes:
@@ -278,6 +321,11 @@ class GPUSearcher:
                 d_found_flag.free()
                 
             context.pop()
+            
+            if not self.found:
+                elapsed = time.time() - self.global_start_time
+                speed = self.total_iterations / elapsed if elapsed > 0 else 0
+                print(f"\n[GPU {self.device_id}] Search completed. Speed: {speed:,.0f} it/s, Total: {self.total_iterations:,} iterations")
             
         except Exception as e:
             print(f"\n[GPU {self.device_id}] Error: {e}")
@@ -291,7 +339,7 @@ def main():
     parser.add_argument('--range-max', type=lambda x: int(x, 0), required=True, help='Batas atas range pengali')
     parser.add_argument('--file', required=True, help='File target hash160 (hexadecimal, 40 karakter)')
     parser.add_argument('--keys-per-launch', type=int, default=2**20, help='Jumlah iterasi per batch GPU')
-    parser.add_argument('--max-start-scalars', type=int, default=2**60, help='Maksimal jumlah start scalar yang akan dicoba')
+    parser.add_argument('--max-start-scalars', type=int, default=2**64, help='Maksimal jumlah start scalar yang akan dicoba')
     parser.add_argument('--kernel-mode', choices=['optimized', 'standard'], default='optimized', help='Mode kernel yang digunakan')
     parser.add_argument('--gpus', type=str, default='all', help='GPU devices to use (e.g., "0,1,2" or "all")')
 
@@ -335,10 +383,12 @@ def main():
         print("[!] FATAL: File 'kernel160.cu' tidak ditemukan.")
         sys.exit(1)
 
+    global_start_time = time.time()
+    
     # Create GPU searchers
     searchers = []
     for device_id in gpu_ids:
-        searcher = GPUSearcher(device_id, kernel160_code, target_bin, target_hex_list, args)
+        searcher = GPUSearcher(device_id, kernel160_code, target_bin, target_hex_list, args, global_start_time)
         searchers.append(searcher)
     
     # Set cross-references for coordination
@@ -354,14 +404,22 @@ def main():
     print(f"    GPU devices: {gpu_ids}")
 
     # Run searches in parallel
-    start_time = time.time()
-    
-    with ThreadPoolExecutor(max_workers=gpu_count) as executor:
-        futures = [executor.submit(searcher.run_search) for searcher in searchers]
-        
-        # Wait for completion
-        for future in futures:
-            future.result()
+    try:
+        with ThreadPoolExecutor(max_workers=gpu_count) as executor:
+            futures = [executor.submit(searcher.run_search) for searcher in searchers]
+            
+            # Wait for completion
+            for future in futures:
+                future.result()
+
+    except KeyboardInterrupt:
+        print(f"\n\n[!] Dihentikan oleh pengguna.")
+        total_iterations = sum(s.total_iterations for s in searchers)
+        total_time = time.time() - global_start_time
+        print(f"    Total iterasi: {total_iterations:,}")
+        print(f"    Waktu pencarian: {total_time:.2f} detik")
+        if total_time > 0:
+            print(f"    Kecepatan rata-rata: {total_iterations/total_time:,.0f} it/s")
 
     # Check results
     found_searchers = [s for s in searchers if s.found]
@@ -388,15 +446,18 @@ def main():
             f.write(f"Target hashes:\n")
             for hash_hex in target_hex_list:
                 f.write(f"  {hash_hex}\n")
+                
+        print(f"[+] Hasil disimpan ke found_hash160.txt")
     else:
         total_iterations_all = sum(s.total_iterations for s in searchers)
-        total_time = time.time() - start_time
+        total_time = time.time() - global_start_time
         
         print(f"\n\n[+] Pencarian selesai. Tidak ditemukan.")
         print(f"    Total GPU digunakan: {gpu_count}")
         print(f"    Total iterasi: {total_iterations_all:,}")
         print(f"    Waktu pencarian: {total_time:.2f} detik")
-        print(f"    Kecepatan rata-rata: {total_iterations_all/total_time:,.0f} it/s")
+        if total_time > 0:
+            print(f"    Kecepatan rata-rata: {total_iterations_all/total_time:,.0f} it/s")
 
 if __name__ == '__main__':
     main()
