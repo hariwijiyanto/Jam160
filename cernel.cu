@@ -454,7 +454,6 @@ __device__ uint64_t find_dp_factor_binary(const DPEntry* dp_table, uint32_t dp_t
     return 0;
 }
 
-// KERNEL UTAMA UNTUK PENCARIAN SEQUENTIAL
 __device__ inline bool device_memcmp(const void *s1, const void *s2, size_t n) {
     const uint8_t *p1 = (const uint8_t *)s1;
     const uint8_t *p2 = (const uint8_t *)s2;
@@ -462,87 +461,6 @@ __device__ inline bool device_memcmp(const void *s1, const void *s2, size_t n) {
         if (p1[i] != p2[i]) return false;
     }
     return true;
-}
-
-// KERNEL SEQUENTIAL DENGAN DP
-extern "C"
-__global__ void find_pubkey_kernel_sequential(
-    const BigInt* start_scalar, const BigInt* step_size, uint64_t max_iterations,
-    const uint8_t* d_target_pubkeys, int num_targets,
-    BigInt* d_result, int* d_found_flag,
-    const uint32_t* d_bloom_filter, uint64_t bloom_size,
-    const DPEntry* d_dp_table, uint32_t dp_table_size
-) {
-    uint64_t idx = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx >= max_iterations || *d_found_flag) return;
-
-    // 1. HITUNG SKALAR UNTUK ITERASI INI
-    BigInt current_scalar;
-    BigInt step_times_idx;
-    bigint_mul_uint32(&step_times_idx, step_size, (uint32_t)idx);
-    ptx_u256Add(&current_scalar, start_scalar, &step_times_idx);
-    scalar_mod_n(&current_scalar, &current_scalar);
-
-    // 2. HITUNG PUBLIC KEY: current_scalar * G
-    ECPointJac result_jac;
-    scalar_multiply_jac_precomputed(&result_jac, &current_scalar);
-
-    // 3. KONVERSI KE AFFINE
-    ECPoint public_key;
-    jacobian_to_affine(&public_key, &result_jac);
-    if (public_key.infinity) return;
-
-    // 4. CEK DP TERLEBIH DAHULU
-    uint64_t low64_x = public_key.x.data[0] | ((uint64_t)public_key.x.data[1] << 32);
-    uint64_t y_parity = (public_key.y.data[0] & 1) ? 1 : 0;
-    uint64_t fp_val = splitmix64(low64_x ^ y_parity);
-
-    if (check_bloom_filter(d_bloom_filter, bloom_size, fp_val)) {
-        uint64_t reduction_factor = find_dp_factor_binary(d_dp_table, dp_table_size, fp_val);
-        if (reduction_factor > 0) {
-            // HITUNG PRIVATE KEY TARGET
-            BigInt target_priv;
-            BigInt reduction_factor_bi;
-            init_bigint(&reduction_factor_bi, 0);
-            for (int j = 0; j < 2; j++) {
-                reduction_factor_bi.data[j] = (uint32_t)(reduction_factor >> (32 * j));
-            }
-
-            ptx_u256Add(&target_priv, &current_scalar, &reduction_factor_bi);
-            scalar_mod_n(&target_priv, &target_priv);
-
-            // VERIFIKASI
-            ECPointJac verification_jac;
-            scalar_multiply_jac_precomputed(&verification_jac, &target_priv);
-            ECPoint verification_affine;
-            jacobian_to_affine(&verification_affine, &verification_jac);
-
-            CompressedPubKey compressed_verification;
-            compress_pubkey(&compressed_verification, &verification_affine);
-
-            for (int i = 0; i < num_targets; i++) {
-                if (device_memcmp(compressed_verification.data, &d_target_pubkeys[i * 33], 33)) {
-                    if (atomicCAS(d_found_flag, 0, 1) == 0) {
-                        copy_bigint(d_result, &target_priv);
-                    }
-                    return;
-                }
-            }
-        }
-    }
-
-    // 5. CEK LANGSUNG DENGAN TARGET
-    CompressedPubKey compressed_pubkey;
-    compress_pubkey(&compressed_pubkey, &public_key);
-
-    for (int i = 0; i < num_targets; i++) {
-        if (device_memcmp(compressed_pubkey.data, &d_target_pubkeys[i * 33], 33)) {
-            if (atomicCAS(d_found_flag, 0, 1) == 0) {
-                copy_bigint(d_result, &current_scalar);
-            }
-            return;
-        }
-    }
 }
 
 // KERNEL UNTUK GENERASI DP DI GPU
