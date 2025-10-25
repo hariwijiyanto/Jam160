@@ -53,10 +53,8 @@ def load_target_hashes(filename):
     print(f"[*] Total {len(targets_hex)} target hash160 loaded")
     return targets_bin, targets_hex
 
-def init_secp256k1_constants_for_gpu(mod, gpu_id):
-    """Initialize secp256k1 curve constants in GPU constant memory for specific GPU"""
-    cuda.Context.set_current(mod.get_context())
-    
+def init_secp256k1_constants(mod):
+    """Initialize secp256k1 curve constants in GPU constant memory"""
     # Prime modulus p
     p_data = np.array([
         0xFFFFFC2F, 0xFFFFFFFE, 0xFFFFFFFF, 0xFFFFFFFF,
@@ -98,13 +96,12 @@ def init_secp256k1_constants_for_gpu(mod, gpu_id):
     const_G_gpu = mod.get_global("const_G_jacobian")[0]
     cuda.memcpy_htod(const_G_gpu, g_jac)
 
-def run_precomputation_for_gpu(mod, gpu_id):
-    """Run GPU precomputation kernel for specific GPU"""
-    cuda.Context.set_current(mod.get_context())
+def run_precomputation(mod):
+    """Run GPU precomputation kernel"""
     precompute_kernel = mod.get_function("precompute_G_table_kernel")
     precompute_kernel(block=(1, 1, 1))
     cuda.Context.synchronize()
-    print(f"[*] GPU {gpu_id}: Precomputation table selesai.")
+    print("[*] Precomputation table selesai.")
 
 def parse_range(range_str):
     """Parse range string in format 'start-end'"""
@@ -126,12 +123,6 @@ class GPUWorker:
         self.found = False
         self.privkey_int = 0
         self.total_iterations = 0
-        self.context = None
-        self.mod = None
-        self.find_hash_kernel = None
-        self.d_target_hashes = None
-        self.d_result = None
-        self.d_found_flag = None
         
         # Set GPU context
         self.device = cuda.Device(gpu_id)
@@ -142,10 +133,10 @@ class GPUWorker:
             self.mod = SourceModule(kernel_code, no_extern_c=False, options=['-std=c++11', '-arch=sm_75'])
             
             # Initialize constants
-            init_secp256k1_constants_for_gpu(self.mod, gpu_id)
+            init_secp256k1_constants(self.mod)
             
             # Run precomputation
-            run_precomputation_for_gpu(self.mod, gpu_id)
+            run_precomputation(self.mod)
             
             # Get kernel function
             self.find_hash_kernel = self.mod.get_function("find_hash_kernel_optimized")
@@ -174,72 +165,91 @@ class GPUWorker:
         if self.found:
             return True
             
-        cuda.Context.set_current(self.context)
+        # Activate context for this thread
+        self.context.push()
         
-        range_size = range_end - range_start
-        iteration_offset = 0
-        found_flag_host = np.zeros(1, dtype=np.int32)
-        
-        while iteration_offset < range_size and not self.found:
-            iterations_left = range_size - iteration_offset
-            iterations_this_launch = min(keys_per_launch, iterations_left)
+        try:
+            range_size = range_end - range_start
+            iteration_offset = 0
+            found_flag_host = np.zeros(1, dtype=np.int32)
             
-            if iterations_this_launch <= 0:
-                break
+            while iteration_offset < range_size and not self.found:
+                iterations_left = range_size - iteration_offset
+                iterations_this_launch = min(keys_per_launch, iterations_left)
+                
+                if iterations_this_launch <= 0:
+                    break
+                
+                block_size = 256
+                grid_size = (iterations_this_launch + block_size - 1) // block_size
+                
+                # Reset found flag for this launch
+                cuda.memset_d32(self.d_found_flag, 0, 1)
+                
+                # Run kernel
+                self.find_hash_kernel(
+                    cuda.In(start_scalar_np),
+                    np.uint64(iterations_this_launch),
+                    cuda.In(range_min_np),
+                    np.uint64(range_start + iteration_offset),
+                    self.d_target_hashes,
+                    np.int32(self.num_targets),
+                    self.d_result,
+                    self.d_found_flag,
+                    block=(block_size, 1, 1),
+                    grid=(grid_size, 1)
+                )
+                
+                self.context.synchronize()
+                
+                iteration_offset += iterations_this_launch
+                self.total_iterations += iterations_this_launch
+                
+                # Check if found
+                cuda.memcpy_dtoh(found_flag_host, self.d_found_flag)
+                if found_flag_host[0] == 1:
+                    # Read result
+                    result_buffer = np.zeros(8, dtype=np.uint32)
+                    cuda.memcpy_dtoh(result_buffer, self.d_result)
+                    self.privkey_int = bigint_np_to_int(result_buffer)
+                    self.found = True
+                    return True
             
-            block_size = 256
-            grid_size = (iterations_this_launch + block_size - 1) // block_size
+            return False
             
-            # Reset found flag for this launch
-            cuda.memset_d32(self.d_found_flag, 0, 1)
-            
-            # Run kernel
-            self.find_hash_kernel(
-                cuda.In(start_scalar_np),
-                np.uint64(iterations_this_launch),
-                cuda.In(range_min_np),
-                np.uint64(range_start + iteration_offset),
-                self.d_target_hashes,
-                np.int32(self.num_targets),
-                self.d_result,
-                self.d_found_flag,
-                block=(block_size, 1, 1),
-                grid=(grid_size, 1)
-            )
-            
-            self.context.synchronize()
-            
-            iteration_offset += iterations_this_launch
-            self.total_iterations += iterations_this_launch
-            
-            # Check if found
-            cuda.memcpy_dtoh(found_flag_host, self.d_found_flag)
-            if found_flag_host[0] == 1:
-                # Read result
-                result_buffer = np.zeros(8, dtype=np.uint32)
-                cuda.memcpy_dtoh(result_buffer, self.d_result)
-                self.privkey_int = bigint_np_to_int(result_buffer)
-                self.found = True
-                return True
-        
-        return False
+        finally:
+            # Always pop context
+            self.context.pop()
     
     def cleanup(self):
         """Clean up GPU context"""
         if self.context:
             self.context.pop()
 
-def worker_thread(gpu_worker, start_scalar_np, range_min_np, range_start, range_end, keys_per_launch, result_queue):
-    """Worker thread function for GPU"""
+def worker_thread(gpu_worker, start_scalars, range_min_np, range_min, range_max, keys_per_launch, result_queue, stop_event):
+    """Worker thread function for GPU dengan multiple start scalars"""
     try:
-        found = gpu_worker.search_range(start_scalar_np, range_min_np, range_start, range_end, keys_per_launch)
-        if found:
-            result_queue.put((gpu_worker.gpu_id, gpu_worker.privkey_int, gpu_worker.total_iterations))
-        else:
-            result_queue.put((gpu_worker.gpu_id, None, gpu_worker.total_iterations))
+        for start_scalar in start_scalars:
+            if stop_event.is_set():
+                break
+                
+            start_scalar_np = int_to_bigint_np(start_scalar)
+            
+            # Search the entire range for this start scalar
+            found = gpu_worker.search_range(start_scalar_np, range_min_np, range_min, range_max, keys_per_launch)
+            
+            if found:
+                result_queue.put((gpu_worker.gpu_id, gpu_worker.privkey_int, gpu_worker.total_iterations, start_scalar))
+                stop_event.set()
+                break
+                
+        # If we finished all start scalars without finding
+        if not stop_event.is_set():
+            result_queue.put((gpu_worker.gpu_id, None, gpu_worker.total_iterations, None))
+            
     except Exception as e:
         print(f"[!] GPU {gpu_worker.gpu_id}: Error in worker thread: {e}")
-        result_queue.put((gpu_worker.gpu_id, None, gpu_worker.total_iterations))
+        result_queue.put((gpu_worker.gpu_id, None, gpu_worker.total_iterations, None))
 
 def main():
     parser = argparse.ArgumentParser(description='CUDA Hash160 Search dengan Multi-GPU Support')
@@ -250,6 +260,9 @@ def main():
     parser.add_argument('--gpus', type=str, default='all', help='GPU IDs to use (contoh: 0,1,2 atau "all")')
 
     args = parser.parse_args()
+
+    # Initialize PyCUDA
+    cuda.init()
 
     # Parse GPU IDs
     if args.gpus.lower() == 'all':
@@ -306,10 +319,46 @@ def main():
             worker.cleanup()
         sys.exit(1)
 
+    # BAGI START SCALAR BERDASARKAN GENAP/GANJIL
+    current_start = args.start
+    
+    # Buat list start scalar untuk setiap GPU
+    start_scalars_per_gpu = [[] for _ in range(num_gpus)]
+    
+    # GPU 0: start scalar genap
+    # GPU 1: start scalar ganjil
+    # Jika ada lebih dari 2 GPU, distribusi round-robin
+    temp_start = current_start
+    gpu_index = 0
+    
+    while temp_start >= 1:
+        if num_gpus == 2:
+            # Khusus untuk 2 GPU: GPU0=genap, GPU1=ganjil
+            if temp_start % 2 == 0:  # Genap
+                start_scalars_per_gpu[0].append(temp_start)
+            else:  # Ganjil
+                start_scalars_per_gpu[1].append(temp_start)
+        else:
+            # Untuk lebih dari 2 GPU: distribusi round-robin
+            start_scalars_per_gpu[gpu_index].append(temp_start)
+            gpu_index = (gpu_index + 1) % num_gpus
+        
+        temp_start -= 1
+    
+    # Balik urutan sehingga mulai dari yang terbesar
+    for i in range(num_gpus):
+        start_scalars_per_gpu[i].reverse()
+    
+    print(f"\n[*] Distribusi start scalar:")
+    for i, scalars in enumerate(start_scalars_per_gpu):
+        if scalars:
+            print(f"    GPU {i}: {len(scalars)} start scalars ({hex(scalars[0])} -> {hex(scalars[-1])})")
+        else:
+            print(f"    GPU {i}: Tidak ada start scalar")
+
     # MAIN MULTI-GPU SEARCH LOOP
     total_iterations_all = 0
     start_time = time.time()
-    current_start = args.start
     found = False
     range_min_np = int_to_bigint_np(range_min)
 
@@ -319,111 +368,91 @@ def main():
     print(f"    Range size: {range_size:,} kemungkinan per start scalar")
     print(f"    Target hash160: {num_targets} hashes")
     print(f"    GPU yang digunakan: {gpu_ids}")
+    if num_gpus == 2:
+        print(f"    Strategi: GPU0=genap, GPU1=ganjil")
 
     try:
-        while current_start >= 1 and not found:
-            print(f"\n[*] Mencoba dengan start scalar: {hex(current_start)}")
-            
-            start_scalar_np = int_to_bigint_np(current_start)
-            
-            # Divide range among GPUs
-            chunk_size = range_size // num_gpus
-            ranges = []
-            for i in range(num_gpus):
-                range_start = range_min + i * chunk_size
-                range_end = range_start + chunk_size - 1 if i < num_gpus - 1 else range_max
-                ranges.append((range_start, range_end))
-            
-            # Reset worker states
-            for worker in gpu_workers:
-                worker.found = False
-                worker.total_iterations = 0
-            
-            # Launch worker threads
-            threads = []
-            result_queue = Queue()
-            
-            for i, worker in enumerate(gpu_workers):
-                range_start, range_end = ranges[i]
+        # Reset worker states
+        for worker in gpu_workers:
+            worker.found = False
+            worker.total_iterations = 0
+        
+        # Launch worker threads dengan stop event
+        threads = []
+        result_queue = Queue()
+        stop_event = threading.Event()
+        
+        for i, worker in enumerate(gpu_workers):
+            if i < len(start_scalars_per_gpu) and start_scalars_per_gpu[i]:
                 thread = threading.Thread(
                     target=worker_thread,
-                    args=(worker, start_scalar_np, range_min_np, range_start, range_end, args.keys_per_launch, result_queue)
+                    args=(worker, start_scalars_per_gpu[i], range_min_np, range_min, range_max, 
+                          args.keys_per_launch, result_queue, stop_event)
                 )
                 threads.append(thread)
                 thread.start()
+        
+        # Wait for all threads and collect results
+        found_gpu_id = None
+        found_privkey = None
+        found_start_scalar = None
+        gpu_iterations = {}
+        
+        for thread in threads:
+            thread.join()
+        
+        # Process results
+        while not result_queue.empty():
+            gpu_id, privkey, iterations, start_scalar = result_queue.get()
+            gpu_iterations[gpu_id] = iterations
+            total_iterations_all += iterations
             
-            # Wait for all threads and collect results
-            found_gpu_id = None
-            found_privkey = None
-            gpu_iterations = {}
+            if privkey is not None:
+                found_gpu_id = gpu_id
+                found_privkey = privkey
+                found_start_scalar = start_scalar
+                found = True
+        
+        # Display progress
+        elapsed = time.time() - start_time
+        speed = total_iterations_all / elapsed if elapsed > 0 else 0
+        
+        # Check if found
+        if found:
+            print(f"\n[+] HASH160 DITEMUKAN di GPU {found_gpu_id}!")
+            print(f"    Private Key: {hex(found_privkey)}")
+            print(f"    Start scalar: {hex(found_start_scalar)}")
+            print(f"    Total iterasi: {total_iterations_all:,}")
+            print(f"    Waktu pencarian: {time.time() - start_time:.2f} detik")
+            print(f"    Speed: {speed:,.0f} it/s")
             
-            for thread in threads:
-                thread.join()
-            
-            # Process results
-            while not result_queue.empty():
-                gpu_id, privkey, iterations = result_queue.get()
-                gpu_iterations[gpu_id] = iterations
-                total_iterations_all += iterations
-                
-                if privkey is not None:
-                    found_gpu_id = gpu_id
-                    found_privkey = privkey
-                    found = True
-            
-            # Display progress
-            elapsed = time.time() - start_time
-            speed = total_iterations_all / elapsed if elapsed > 0 else 0
-            
-            progress_str = (f"[+] Start: {hex(current_start)} | "
-                          f"Total iterasi: {total_iterations_all:,} | "
-                          f"Speed: {speed:,.0f} it/s | "
-                          f"Running: {elapsed:.0f}s")
-            sys.stdout.write('\r' + progress_str.ljust(120))
-            sys.stdout.flush()
-            
-            # Check if found
-            if found:
-                sys.stdout.write('\n')
-                print(f"\n[+] HASH160 DITEMUKAN di GPU {found_gpu_id}!")
-                print(f"    Private Key: {hex(found_privkey)}")
-                print(f"    Start scalar: {hex(current_start)}")
-                print(f"    Total iterasi: {total_iterations_all:,}")
-                print(f"    Waktu pencarian: {time.time() - start_time:.2f} detik")
-                
-                # Verifikasi dengan perhitungan ulang
-                n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-                expected_privkey = (current_start) % n
-                if expected_privkey == found_privkey:
-                    print(f"    [VERIFIED] Private key valid")
-                else:
-                    print(f"    [WARNING] Private key tidak sesuai")
-                
-                # Simpan hasil
-                with open("found_hash160.txt", "w") as f:
-                    f.write(f"Private Key: {hex(found_privkey)}\n")
-                    f.write(f"Start scalar: {hex(current_start)}\n")
-                    f.write(f"Total iterations: {total_iterations_all}\n")
-                    f.write(f"Search time: {time.time() - start_time:.2f} seconds\n")
-                    f.write(f"Range: {hex(range_min)} - {hex(range_max)}\n")
-                    f.write(f"Target hashes:\n")
-                    for hash_hex in target_hex_list:
-                        f.write(f"  {hash_hex}\n")
+            # Verifikasi dengan perhitungan ulang
+            n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
+            expected_privkey = (found_start_scalar) % n
+            if expected_privkey == found_privkey:
+                print(f"    [VERIFIED] Private key valid")
             else:
-                # Tidak ditemukan di start scalar ini, lanjut ke berikutnya
-                print(f"\n[*] Tidak ditemukan di start scalar {hex(current_start)}, melanjutkan ke {hex(current_start-1)}")
-                current_start -= 1
-
-        # Handle final results
-        if not found:
+                print(f"    [WARNING] Private key tidak sesuai")
+            
+            # Simpan hasil
+            with open("found_hash160.txt", "w") as f:
+                f.write(f"Private Key: {hex(found_privkey)}\n")
+                f.write(f"Start scalar: {hex(found_start_scalar)}\n")
+                f.write(f"Total iterations: {total_iterations_all}\n")
+                f.write(f"Search time: {time.time() - start_time:.2f} seconds\n")
+                f.write(f"Speed: {speed:.0f} it/s\n")
+                f.write(f"Range: {hex(range_min)} - {hex(range_max)}\n")
+                f.write(f"Target hashes:\n")
+                for hash_hex in target_hex_list:
+                    f.write(f"  {hash_hex}\n")
+        else:
             print(f"\n\n[+] Pencarian selesai. Tidak ditemukan.")
             print(f"    Total iterasi: {total_iterations_all:,}")
-            print(f"    Start scalar terakhir: {hex(current_start)}")
             print(f"    Waktu pencarian: {time.time() - start_time:.2f} detik")
+            print(f"    Speed: {speed:,.0f} it/s")
 
     except KeyboardInterrupt:
         print(f"\n\n[!] Dihentikan oleh pengguna.")
-        print(f"    Start scalar saat ini: {hex(current_start)}")
         print(f"    Total iterasi: {total_iterations_all:,}")
         print(f"    Waktu pencarian: {time.time() - start_time:.2f} detik")
     except Exception as e:
