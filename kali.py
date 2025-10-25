@@ -101,22 +101,37 @@ def run_precomputation(mod):
     cuda.Context.synchronize()
     print("[*] Precomputation table selesai.")
 
+def parse_range(range_str):
+    """Parse range string in format 'start-end'"""
+    range_parts = range_str.split('-')
+    if len(range_parts) != 2:
+        raise ValueError("Format range tidak valid. Gunakan format: start-end (contoh: 0x3d94cd60-0x3d94cd69)")
+    
+    range_min = int(range_parts[0], 0)
+    range_max = int(range_parts[1], 0)
+    
+    if range_min >= range_max:
+        raise ValueError("Batas bawah range harus lebih kecil dari batas atas")
+    
+    return range_min, range_max
+
 def main():
     parser = argparse.ArgumentParser(description='CUDA Hash160 Search dengan Sequential Scalar Multiplication')
     parser.add_argument('--start', type=lambda x: int(x, 0), required=True, help='Skalar awal perkalian')
-    parser.add_argument('--range-min', type=lambda x: int(x, 0), required=True, help='Batas bawah range pengali')
-    parser.add_argument('--range-max', type=lambda x: int(x, 0), required=True, help='Batas atas range pengali')
+    parser.add_argument('--range', type=str, required=True, help='Range pengali (format: start-end, contoh: 0x3d94cd60-0x3d94cd69)')
     parser.add_argument('--file', required=True, help='File target hash160 (hexadecimal, 40 karakter)')
     parser.add_argument('--keys-per-launch', type=int, default=2**20, help='Jumlah iterasi per batch GPU')
 
     args = parser.parse_args()
 
-    # Validasi range
-    if args.range_min >= args.range_max:
-        print("[!] ERROR: range-min harus lebih kecil dari range-max")
+    # Parse range
+    try:
+        range_min, range_max = parse_range(args.range)
+    except ValueError as e:
+        print(f"[!] ERROR: {e}")
         sys.exit(1)
 
-    range_size = args.range_max - args.range_min + 1
+    range_size = range_max - range_min + 1
     print(f"[*] Range size: {range_size:,} kemungkinan multiplier")
 
     # Load target hashes
@@ -165,16 +180,13 @@ def main():
     start_time = time.time()
     found_flag_host = np.zeros(1, dtype=np.int32)
 
-    range_min_np = int_to_bigint_np(args.range_min)
-    range_max_np = int_to_bigint_np(args.range_max)
-
     current_start = args.start
-    step_np = int_to_bigint_np(1)
+    range_min_np = int_to_bigint_np(range_min)
     found = False
 
     print(f"\n[*] Memulai pencarian sequential hash160:")
     print(f"    Start scalar awal: {hex(args.start)}")
-    print(f"    Range pengali: {hex(args.range_min)} - {hex(args.range_max)}")
+    print(f"    Range pengali: {hex(range_min)} - {hex(range_max)}")
     print(f"    Range size: {range_size:,} kemungkinan per start scalar")
     print(f"    Target hash160: {num_targets} hashes")
 
@@ -205,7 +217,8 @@ def main():
                 find_hash_kernel(
                     cuda.In(start_scalar_np),
                     np.uint64(iterations_this_launch),
-                    cuda.In(step_np),
+                    cuda.In(range_min_np),
+                    np.uint64(iteration_offset),
                     d_target_hashes,
                     np.int32(num_targets),
                     d_result,
@@ -254,7 +267,7 @@ def main():
 
                 # Verifikasi dengan perhitungan ulang
                 n = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141
-                expected_privkey = (current_start) % n
+                expected_privkey = (current_start * (range_min + total_iterations_all - 1)) % n
                 if expected_privkey == privkey_int:
                     print(f"    [VERIFIED] Private key valid")
                 else:
@@ -266,13 +279,13 @@ def main():
                     f.write(f"Start scalar: {hex(current_start)}\n")
                     f.write(f"Total iterations: {total_iterations_all}\n")
                     f.write(f"Search time: {time.time() - start_time:.2f} seconds\n")
-                    f.write(f"Range: {hex(args.range_min)} - {hex(args.range_max)}\n")
+                    f.write(f"Range: {hex(range_min)} - {hex(range_max)}\n")
                     f.write(f"Target hashes:\n")
                     for hash_hex in target_hex_list:
                         f.write(f"  {hash_hex}\n")
 
             else:
-                # Tidak ditemukan di start scalar ini, lanjut ke berikutnya
+                # Tidak ditemukan di start scalar ini, lanjut ke start scalar berikutnya (current_start - 1)
                 print(f"\n[*] Tidak ditemukan di start scalar {hex(current_start)}, melanjutkan ke {hex(current_start-1)}")
                 current_start -= 1
 
