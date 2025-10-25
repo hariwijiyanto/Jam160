@@ -990,7 +990,8 @@ extern "C"
 __global__ void find_hash_kernel_optimized(
     const BigInt* start_key,
     unsigned long long keys_per_launch,
-    const BigInt* step,
+    const BigInt* range_min,
+    unsigned long long iteration_offset,
     const uint8_t* d_targets,
     int num_targets,
     BigInt* d_result,
@@ -999,17 +1000,17 @@ __global__ void find_hash_kernel_optimized(
     unsigned long long idx = (unsigned long long)blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= keys_per_launch || *d_found_flag) return;
 
-    // 1. HITUNG PRIVATE KEY: start_key + step * idx
+    // 1. HITUNG PRIVATE KEY: start_key * (range_min + iteration_offset + idx)
+    BigInt current_multiplier;
+    
+    // Hitung multiplier = range_min + iteration_offset + idx
+    BigInt offset_idx_big;
+    init_bigint_from_u64(&offset_idx_big, iteration_offset + idx);
+    bigint_add(&current_multiplier, range_min, &offset_idx_big);
+
+    // Hitung private key = start_key * multiplier
     BigInt current_priv;
-    BigInt priv_idx_mul_step;
-
-    // Kalikan step dengan idx menggunakan perkalian 256-bit penuh
-    BigInt idx_big;
-    init_bigint_from_u64(&idx_big, idx);
-    bigint_mul(&priv_idx_mul_step, step, &idx_big);
-
-    // Tambahkan ke start_key
-    ptx_u256Add(&current_priv, start_key, &priv_idx_mul_step);
+    bigint_mul(&current_priv, start_key, &current_multiplier);
 
     // Modulo n (curve order)
     scalar_mod_n(&current_priv, &current_priv);
